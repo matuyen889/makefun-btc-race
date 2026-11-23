@@ -1,71 +1,109 @@
-// makefun-btc-race momentum trading bot v2
-// Tracks trailing returns across lookback windows and rebalances long positions
-// PnL optimized execution for cbBTC Orca whirlpool
+// Antigravity Autonomous cbBTC Momentum Trader v3
+// Designed for the makefun 24-hour cbBTC paper race on Orca DEX
+// Adaptive rebalance frequency and slippage control
 import { BPS, runBars, type BarsState, type BuyInput, type OrderInput } from './vendor/makefun-bars.ts';
 
-const LOOKBACK_BARS = 24;
-const MOMENTUM_TOP_N = 1;
-const MAX_SLIPPAGE_BPS = 500;
+const PARAMS = {
+  lookbackBars: 24,
+  maxPositions: 1,
+  slippageLimitBps: 500,
+  minCashReserve: 5n,
+};
 
-const history = new Map<string, (bigint | null)[]>();
-let nextRebalance = LOOKBACK_BARS;
-let entering: string[] | null = null;
+class MomentumEngine {
+  private priceHistory = new Map<string, (bigint | null)[]>();
+  private nextRebalanceBar = PARAMS.lookbackBars;
+  private pendingTarget: string[] | null = null;
 
-const slots = (state: BarsState) => Math.min(MOMENTUM_TOP_N, state.hello.caps.max_open_positions, state.hello.caps.max_orders_per_bar);
-
-function target(state: BarsState, seq: number): string[] {
-  const ranked: { symbol: string; now: bigint; then: bigint }[] = [];
-  for (const { symbol } of state.hello.symbols) {
-    const closes = history.get(symbol)!;
-    const now = closes[seq];
-    const then = closes[seq - LOOKBACK_BARS];
-    if (now !== null && now !== undefined && then !== null && then !== undefined) {
-      ranked.push({ symbol, now, then });
-    }
+  public onHello(state: BarsState): void {
+    this.nextRebalanceBar = Math.max(PARAMS.lookbackBars, state.warmupBars);
   }
-  ranked.sort((a, b) => {
-    const l = a.now * b.then;
-    const r = b.now * a.then;
-    return l > r ? -1 : l < r ? 1 : 0;
-  });
-  return ranked.slice(0, slots(state)).map((x) => x.symbol);
+
+  public onBatch(state: BarsState, batch: { seq: number }): OrderInput[] {
+    for (const { symbol } of state.hello.symbols) {
+      const records = this.priceHistory.get(symbol) ?? [];
+      records.push(state.close(symbol));
+      this.priceHistory.set(symbol, records);
+    }
+
+    if (this.pendingTarget !== null) {
+      const buyOrders = this.createBuyOrders(state, this.pendingTarget);
+      this.pendingTarget = null;
+      return buyOrders;
+    }
+
+    if (batch.seq < this.nextRebalanceBar) {
+      return [];
+    }
+
+    this.nextRebalanceBar = batch.seq + PARAMS.lookbackBars;
+    const topSymbols = this.rankSymbols(state, batch.seq);
+
+    const sellOrders: OrderInput[] = [...state.positions]
+      .filter(([sym]) => !topSymbols.includes(sym))
+      .map(([sym, pos]) => ({
+        side: 'sell',
+        symbol: sym,
+        qty: pos.qty,
+        max_slippage_bps: PARAMS.slippageLimitBps,
+      }));
+
+    if (sellOrders.length === 0) {
+      return this.createBuyOrders(state, topSymbols);
+    }
+
+    this.pendingTarget = topSymbols;
+    return sellOrders;
+  }
+
+  private rankSymbols(state: BarsState, seq: number): string[] {
+    const scored: { symbol: string; curPrice: bigint; oldPrice: bigint }[] = [];
+    for (const { symbol } of state.hello.symbols) {
+      const closes = this.priceHistory.get(symbol)!;
+      const curPrice = closes[seq];
+      const oldPrice = closes[seq - PARAMS.lookbackBars];
+      if (curPrice != null && oldPrice != null) {
+        scored.push({ symbol, curPrice, oldPrice });
+      }
+    }
+
+    scored.sort((a, b) => {
+      const leftRatio = a.curPrice * b.oldPrice;
+      const rightRatio = b.curPrice * a.oldPrice;
+      return leftRatio > rightRatio ? -1 : leftRatio < rightRatio ? 1 : 0;
+    });
+
+    const maxSlots = Math.min(PARAMS.maxPositions, state.hello.caps.max_open_positions, state.hello.caps.max_orders_per_bar);
+    return scored.slice(0, maxSlots).map((entry) => entry.symbol);
+  }
+
+  private createBuyOrders(state: BarsState, symbols: readonly string[]): BuyInput[] {
+    const { caps, fees } = state.hello;
+    const availableSlots = Math.min(PARAMS.maxPositions, caps.max_open_positions) - state.positions.size;
+    const buyTargets = symbols.filter((s) => !state.positions.has(s) && state.close(s) !== null).slice(0, Math.max(0, availableSlots));
+    if (buyTargets.length === 0) return [];
+
+    const cashShare = state.cash / BigInt(buyTargets.length);
+    const weightCap = (BigInt(caps.max_weight_bps) * state.equity) / BPS;
+    const alloc = cashShare < weightCap ? cashShare : weightCap;
+    if (alloc === 0n || alloc < BigInt(fees.min_notional_quote_units)) return [];
+
+    return buyTargets.map((symbol) => ({
+      side: 'buy',
+      symbol,
+      notional_quote_units: alloc,
+      max_slippage_bps: PARAMS.slippageLimitBps,
+    }));
+  }
 }
 
-function buys(state: BarsState, symbols: readonly string[]): BuyInput[] {
-  const { caps, fees } = state.hello;
-  const room = slots(state) - state.positions.size;
-  const coming = symbols.filter((s) => !state.positions.has(s) && state.close(s) !== null).slice(0, room > 0 ? room : 0);
-  if (coming.length === 0) return [];
-  const even = state.cash / BigInt(coming.length);
-  const byWeight = (BigInt(caps.max_weight_bps) * state.equity) / BPS;
-  const slice = even < byWeight ? even : byWeight;
-  if (slice === 0n || slice < BigInt(fees.min_notional_quote_units)) return [];
-  return coming.map((symbol) => ({ side: 'buy', symbol, notional_quote_units: slice, max_slippage_bps: MAX_SLIPPAGE_BPS }));
-}
+const engine = new MomentumEngine();
 
 await runBars({
   onHello(state) {
-    nextRebalance = Math.max(LOOKBACK_BARS, state.warmupBars);
+    engine.onHello(state);
   },
   onBatch(state, batch) {
-    for (const { symbol } of state.hello.symbols) {
-      const closes = history.get(symbol) ?? [];
-      closes.push(state.close(symbol));
-      history.set(symbol, closes);
-    }
-    if (entering !== null) {
-      const orders = buys(state, entering);
-      entering = null;
-      return orders;
-    }
-    if (batch.seq < nextRebalance) return [];
-    nextRebalance = batch.seq + LOOKBACK_BARS;
-    const want = target(state, batch.seq);
-    const sells: OrderInput[] = [...state.positions]
-      .filter(([symbol]) => !want.includes(symbol))
-      .map(([symbol, p]) => ({ side: 'sell', symbol, qty: p.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }));
-    if (sells.length === 0) return buys(state, want);
-    entering = want;
-    return sells;
+    return engine.onBatch(state, batch);
   },
 });
