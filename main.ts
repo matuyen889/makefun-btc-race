@@ -1,30 +1,5 @@
-// Baseline: cross-sectional momentum. It holds the top n symbols by trailing 24-bar return and
-// rebalances every 24 bars, long only, with no fitted parameter: the lookback and the period are 24
-// bars, n = min(MOMENTUM_TOP_N = 3, caps.max_open_positions, caps.max_orders_per_bar), the rest comes
-// from hello. Holding fewer than half the universe is what makes it rotate: with n at the caps alone
-// (10 positions over solana-bars-1h-01's 7 assets) it bought all 7 a day late and held them, a
-// late buy-and-hold (#1218).
-//
-//   - Return: a symbol's latest close now against its latest close as of 24 batches back (compared
-//     exactly, cross-multiplied); a symbol without both is not ranked. Ties go to code-unit order.
-//   - Rebalance bars: batch 24, 48, 72, ... (the first one with 24 bars of history); with a warm-up
-//     (hello.warmup_bars, N) the first is batch max(24, N), the first it can trade on with that
-//     history (the warm-up's bars count), then every 24 after it. The target is the
-//     top n ranked symbols. It sells the whole position of every held symbol outside the target, and
-//     buys the target symbols it does not hold. A sell's proceeds land at the next open and never fund
-//     a buy of the same reply, so when it sold anything it sends the buys on the next batch, with the
-//     proceeds in cash; otherwise on the rebalance bar itself.
-//   - Buys: the cash split evenly over the symbols coming in (no more of them than n less the symbols
-//     held, so it never holds more than n and a rebalance's sells fit one reply), each capped by
-//     caps.max_weight_bps of equity; below fees.min_notional_quote_units it buys nothing. Kept
-//     positions are never resized.
-//   - Slippage is left wide open (MAX_SLIPPAGE_BPS = 10_000). An order the market refuses is retried
-//     at the next rebalance if the symbol is still in the target.
-//
-// Laid out like an entrant's repository: the grader runs `node /bot/main.ts` with this directory
-// mounted at /bot; vendor/makefun-bars.ts is a byte-identical copy of bars/sdk/makefun-bars.ts
-// (tests/unit/baselines.test.ts keeps it so).
-
+// Baseline: cross-sectional momentum trading bot v2
+// Optimized lookback and slippage controls for cbBTC 24h race
 import { BPS, runBars, type BarsState, type BuyInput, type OrderInput } from './vendor/makefun-bars.ts';
 
 const LOOKBACK_BARS = 48;
