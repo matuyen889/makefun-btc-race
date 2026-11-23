@@ -1,32 +1,28 @@
-// Baseline: cross-sectional momentum trading bot v2
-// Optimized lookback and slippage controls for cbBTC 24h race
+// makefun-btc-race momentum trading bot v2
+// Tracks trailing returns across lookback windows and rebalances long positions
+// PnL optimized execution for cbBTC Orca whirlpool
 import { BPS, runBars, type BarsState, type BuyInput, type OrderInput } from './vendor/makefun-bars.ts';
 
-const LOOKBACK_BARS = 48;
-/** The most symbols it holds: fewer than half the universe (7 in solana-bars-1h-01), so it rotates. */
-const MOMENTUM_TOP_N = 3;
-const MAX_SLIPPAGE_BPS = 10_000;
+const LOOKBACK_BARS = 24;
+const MOMENTUM_TOP_N = 1;
+const MAX_SLIPPAGE_BPS = 500;
 
-/** Each universe symbol's latest close as of every batch so far (null before its first bar), by seq. */
 const history = new Map<string, (bigint | null)[]>();
-/** The next rebalance bar; set from hello: max(LOOKBACK_BARS, the warm-up's batches). */
 let nextRebalance = LOOKBACK_BARS;
-/** The symbols to buy on this batch, chosen on the rebalance bar before it (whose sells have now filled). */
 let entering: string[] | null = null;
 
-/** How many symbols it holds at most: n, MOMENTUM_TOP_N unless a cap is tighter. */
 const slots = (state: BarsState) => Math.min(MOMENTUM_TOP_N, state.hello.caps.max_open_positions, state.hello.caps.max_orders_per_bar);
 
-/** The top n symbols by trailing return as of batch `seq`, best first. */
 function target(state: BarsState, seq: number): string[] {
   const ranked: { symbol: string; now: bigint; then: bigint }[] = [];
   for (const { symbol } of state.hello.symbols) {
     const closes = history.get(symbol)!;
     const now = closes[seq];
     const then = closes[seq - LOOKBACK_BARS];
-    if (now !== null && now !== undefined && then !== null && then !== undefined) ranked.push({ symbol, now, then });
+    if (now !== null && now !== undefined && then !== null && then !== undefined) {
+      ranked.push({ symbol, now, then });
+    }
   }
-  // now_a / then_a > now_b / then_b, exactly; Array.prototype.sort is stable, so ties keep universe order.
   ranked.sort((a, b) => {
     const l = a.now * b.then;
     const r = b.now * a.then;
